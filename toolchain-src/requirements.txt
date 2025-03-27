@@ -1,0 +1,8 @@
+.
+lgg
+onnx
+onnxsim
+sclblonnx
+numpy
+requests
+memryx
