@@ -1,6 +1,7 @@
 # ONNX → DFP MemryX Conversion Toolchain (Docker)
 
-This toolchain provides a **Docker-based workflow** for compiling ONNX models into MemryX artifacts (`.dfp` + `chain.json`) using the MemryX Neural Compiler.
+This toolchain provides a **Docker-based workflow** for compiling ONNX models into MemryX
+artifacts (`.dfp` + `chain.json`) using the MemryX Neural Compiler.
 
 The toolchain is designed to be:
 - reproducible
@@ -70,45 +71,112 @@ Create directories on the host for inputs and outputs:
 mkdir -p artifacts out
 ```
 
-Copy your ONNX model into `artifacts/`:
+---
 
-```bash
-cp /absolute/path/to/model.onnx artifacts/model.onnx
+## Prepare the Input Model Archive
+
+The toolchain expects a **single zip archive** as input instead of a raw ONNX file.
+
+The archive **must** contain:
+- One or more `.onnx` model files
+- A required `ncconfig.json` file describing NeuralCompiler configuration
+
+### Example (single model)
+
 ```
+model.zip
+├── ncconfig.json
+├── model.onnx
+```
+
+### Example (co-mapped models)
+
+```
+model.zip
+├── ncconfig.json
+├── model_a.onnx
+├── model_b.onnx
+```
+
+All model paths listed in `ncconfig.json` must be **relative to the root of the archive**.
+
+---
+
+## ncconfig.json
+
+`ncconfig.json` is a **flat JSON object** whose keys are passed directly to
+`NeuralCompiler.set_config()`.
+
+### Minimal example
+
+```json
+{
+  "models": ["model.onnx"],
+  "num_chips": 4,
+  "chip_gen": "mx3",
+  "autocrop": true
+}
+```
+
+### Co-mapping example
+
+```json
+{
+  "models": ["model_a.onnx", "model_b.onnx"],
+  "num_chips": 8,
+  "effort": "hard"
+}
+```
+
+### Using compiler extensions
+
+```json
+{
+  "models": ["model.onnx"],
+  "extensions": [
+    "Yolov10"
+  ]
+}
+```
+
+Notes:
+- `models` **must** be a non-empty list
+- `extensions`, if provided, **must** be a JSON list
+- All configuration validation is performed by the NeuralCompiler itself
+
+For a full list of supported parameters, refer to:
+https://developer.memryx.com/tools/neural_compiler.html
 
 ---
 
 ## Run the Conversion
 
-Run the container and invoke the conversion tool:
+The container expects **two positional arguments**:
 
-```bash
-docker run --rm -it \
-  -v "$(pwd)/artifacts:/artifacts" \
-  -v "$(pwd)/out:/out" \
-  onnx-to-memryx:latest \
-  --onnx-path /artifacts/model.onnx \
-  --output-dir /out \
-  --num_chips 4
+```
+<model_archive.zip> <output_dir>
 ```
 
-### Optional arguments
-
-#### Number of chips
-```bash
---num_chips 2
-```
-
-#### Compiler extensions
-Extensions are passed as a list and support multiple formats:
+Example:
 
 ```bash
---extensions foo
---extensions foo --extensions bar
---extensions "foo,bar"
---extensions '["foo","bar"]'
+docker run --rm -it   -v "$(pwd)/artifacts:/artifacts"   -v "$(pwd)/out:/out"   onnx-to-memryx:latest   /artifacts/model.zip   /out
 ```
-For more details about MemryX Neural Compiler Extensions please read [MX Neural Compiler Page](https://developer.memryx.com/tools/neural_compiler.html#neural-compiler-extensions)
+
+---
+
+## Toolchain-Enforced Behavior
+
+The following settings are **controlled by the toolchain** and cannot be overridden
+via `ncconfig.json`:
+
+| Setting | Behavior |
+|------|--------|
+| `models` | Resolved from the extracted archive |
+| `dfp_fname` | Automatically generated with a timestamp |
+| `num_processes` | Forced to `(CPU cores - 2)`, minimum 1 |
+
+All other configuration values are passed unchanged to the NeuralCompiler.
 
 ---
 
@@ -122,10 +190,10 @@ out/
     └── model.zip
 ```
 
-The zip file contains:
-- compiled `.dfp`
-- generated `chain.json`
-- optional `*_pre.onnx` / `*_post.onnx` (if emitted by the compiler)
+The output zip contains:
+- Compiled `.dfp`
+- Generated `chain.json`
+- Optional `*_pre.onnx` / `*_post.onnx` (if emitted)
 
 Artifact filenames inside the zip are prefixed with a **human-readable UTC timestamp** to ensure uniqueness:
 
@@ -156,16 +224,17 @@ docker build -t onnx-to-memryx:latest .
 
 ## Design Notes
 
-- The toolchain runs entirely inside Docker to avoid host dependency conflicts.
-- The MemryX SDK is installed at **image build time** for faster repeated conversions.
-- Each conversion run uses an isolated temporary workspace inside the container.
-- Outputs are copied and packaged to avoid filename collisions across runs.
+- The toolchain runs entirely inside Docker to avoid host dependency conflicts
+- Each conversion run uses an isolated temporary workspace
+- Output artifacts are copied and packaged to avoid filename collisions
+- The zip-based input contract enables reproducible, configuration-driven compilation
 
 ---
 
 ## Troubleshooting
 
 ### Docker not found
+
 Ensure Docker is installed and the daemon is running:
 
 ```bash

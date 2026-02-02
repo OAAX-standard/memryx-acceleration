@@ -2,14 +2,12 @@ import json
 import os
 import re
 import shutil
-import time
 import zipfile
 from glob import glob
 from os.path import basename, dirname, join, split, splitext
 import tempfile
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
-from typing import Iterable
 from datetime import datetime
 
 import onnx
@@ -17,91 +15,321 @@ from memryx import NeuralCompiler
 
 from .logger import logs
 
-# Default compiler configuration.
-mxa_chip_gen = 'mx3'
-mxa_auto_crop = True
+def _extract_model_archive(model_zip_path: str, work_dir: str) -> None:
+    """Extract the input model archive into the workspace directory.
+
+    Args:
+        model_zip_path: Path to the input .zip archive.
+        work_dir: Directory where archive contents will be extracted.
+
+    Raises:
+        FileNotFoundError: If model_zip_path does not exist.
+        zipfile.BadZipFile: If the archive is not a valid zip.
+    """
+    if not os.path.isfile(model_zip_path):
+        raise FileNotFoundError(f"Model archive not found: {model_zip_path}")
+
+    with zipfile.ZipFile(model_zip_path, "r") as zf:
+        zf.extractall(work_dir)
+
+
+def _load_ncconfig(work_dir: str) -> Dict[str, Any]:
+    """Load ncconfig.json from the extracted workspace (flat config).
+
+    Args:
+        work_dir: Workspace directory where the archive was extracted.
+
+    Returns:
+        Flat JSON config as a dict.
+
+    Raises:
+        FileNotFoundError: If ncconfig.json is missing.
+        ValueError: If ncconfig.json is not a JSON object.
+        json.JSONDecodeError: If ncconfig.json is not valid JSON.
+    """
+    config_path = join(work_dir, "ncconfig.json")
+    if not os.path.isfile(config_path):
+        raise FileNotFoundError(f"Missing ncconfig.json in archive (expected at top level): {config_path}")
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    if not isinstance(cfg, dict):
+        raise ValueError("ncconfig.json must contain a JSON object (dictionary).")
+
+    return cfg
+
+
+def _resolve_models_from_config(cfg: Dict[str, Any], work_dir: str) -> List[str]:
+    """Resolve config 'models' entries to extracted file paths in the workspace.
+
+    Users are expected to include all referenced .onnx files in the archive and list
+    them in cfg['models'] by filename (or relative path within the archive).
+
+    Args:
+        cfg: Flat config dict loaded from ncconfig.json.
+        work_dir: Workspace directory where archive contents were extracted.
+
+    Returns:
+        List of absolute paths to ONNX model files in the workspace.
+
+    Raises:
+        KeyError: If 'models' is missing in cfg.
+        ValueError: If 'models' is not a non-empty list.
+        FileNotFoundError: If any referenced model file is missing in the workspace.
+    """
+    if "models" not in cfg:
+        raise KeyError("ncconfig.json missing required key: 'models'")
+
+    models = cfg["models"]
+    if not isinstance(models, list) or not models:
+        raise ValueError("'models' must be a non-empty JSON list in ncconfig.json")
+
+    resolved: List[str] = []
+    for m in models:
+        if not isinstance(m, str) or not m.strip():
+            raise ValueError("Each entry in 'models' must be a non-empty string")
+        path = join(work_dir, m)
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"Model listed in ncconfig.json not found in archive: {m}")
+        resolved.append(path)
+
+    return resolved
+
+
+def _timestamp_tag() -> str:
+    """Return a filesystem-safe, human-readable UTC timestamp."""
+    return datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+
+
+def _forced_num_processes() -> int:
+    """Force num_processes to (cpu_count - 2), with a floor of 1."""
+    cpu_count = os.cpu_count() or 1
+    return max(1, cpu_count - 2)
+
+
+def _dfp_filename_for_models(models: List[str], timestamp: str) -> str:
+    """Compute the DFP filename given resolved model paths.
+
+    If a single model is compiled, use:
+        <timestamp>_<modelstem>.dfp
+
+    If multiple models are co-mapped, use:
+        <timestamp>_models.dfp
+    """
+    if len(models) == 1:
+        model_stem = splitext(basename(models[0]))[0]
+        return f"{timestamp}_{model_stem}.dfp"
+    return f"{timestamp}_models.dfp"
+
+def _apply_ncconfig(nc: NeuralCompiler, cfg: Dict[str, Any]) -> None:
+    """Apply a flat ncconfig.json dict to a NeuralCompiler instance using set_config().
+
+    This function intentionally defers validation to the NeuralCompiler. If a key/value
+    is invalid, NeuralCompiler will raise; the caller should log and surface that error.
+    """
+    for key, value in cfg.items():
+        # Skip keys we explicitly manage/override elsewhere in the toolchain.
+        if key in {"dfp_fname", "num_processes", "models"}:
+            continue
+
+        # # Normalize extensions into a list; NeuralCompiler expects a list.
+        # if key == "extensions":
+        #     value = _normalize_extensions(value)
+
+        nc.set_config(**{key: value})
+
+
+def _override_toolchain_config(
+    nc: NeuralCompiler,
+    *,
+    dfp_path: str,
+    num_processes: int,
+) -> None:
+    """Force toolchain-controlled config values onto NeuralCompiler.
+
+    Args:
+        dfp_path: Absolute path for the output .dfp file in the workspace.
+        num_processes: Forced compilation process count (cpu_count - 2, floored at 1).
+    """
+    nc.set_config(dfp_fname=dfp_path)
+    nc.set_config(num_processes=num_processes)
+
+
+def _resolved_compiler_settings_for_logs(cfg: Dict[str, Any], *, num_processes: int, dfp_path: str) -> Dict[str, Any]:
+    """Create a compact log-friendly view of compiler settings.
+
+    This explains what the toolchain will apply (including forced overrides),
+    without attempting to fully mirror NeuralCompiler's internal config.
+    """
+    out: Dict[str, Any] = dict(cfg)
+
+    # Toolchain overrides win.
+    out["dfp_fname"] = dfp_path
+    out["num_processes"] = num_processes
+    return out
+
 
 @dataclass(frozen=True)
-class CompilePaths:
+class CompilePlan:
     work_dir: str
+    cfg: Dict[str, Any]
+    models: List[str]
     onnx_model_name: str
     dfp_path: str
     chain_json_path: str
+    num_processes: int
+    timestamp: str
 
 
-def _plan_paths(onnx_path: str) -> CompilePaths:
-    # Unique workspace per run avoids collisions across concurrent executions.
+def _plan_from_archive(model_zip_path: str) -> CompilePlan:
+    """Create a compile plan from a model archive (.zip).
+
+    The archive is extracted into a unique workspace directory, ncconfig.json is loaded,
+    and the referenced ONNX model files are resolved.
+
+    Toolchain-controlled values are computed here:
+      - timestamp tag
+      - forced num_processes = cpu_count - 2 (floored at 1)
+      - dfp_fname override path (workspace-local)
+
+    Args:
+        model_zip_path: Path to a zip archive containing .onnx file(s) and ncconfig.json.
+
+    Returns:
+        A CompilePlan containing resolved paths, config, and toolchain overrides.
+    """
     work_dir = tempfile.mkdtemp(prefix="mxa_compile_")
 
-    # Model name derived from ONNX filename (stable, human-readable).
-    onnx_model_name = splitext(basename(onnx_path))[0]
+    _extract_model_archive(model_zip_path, work_dir)
+    cfg = _load_ncconfig(work_dir)
+    models = _resolve_models_from_config(cfg, work_dir)
 
-    # All intermediate artifacts live in the workspace.
-    dfp_path = join(work_dir, f"{onnx_model_name}.dfp")
+    ts = _timestamp_tag()
+    num_processes = _forced_num_processes()
+
+    # Use the first model name for folder naming and output packaging.
+    onnx_model_name = splitext(basename(models[0]))[0]
+
+    # Force dfp output name based on single vs multi-model.
+    dfp_basename = _dfp_filename_for_models(models, ts)
+    dfp_path = join(work_dir, dfp_basename)
+
+    # chain.json is always workspace-local; packaged into the final output zip.
     chain_json_path = join(work_dir, "chain.json")
 
-    return CompilePaths(
+    return CompilePlan(
         work_dir=work_dir,
+        cfg=cfg,
+        models=models,
         onnx_model_name=onnx_model_name,
         dfp_path=dfp_path,
         chain_json_path=chain_json_path,
+        num_processes=num_processes,
+        timestamp=ts,
     )
 
+def _package_artifacts(
+    *,
+    output_dir: str,
+    model_name: str,
+    dfp_path: str,
+    chain_json_path: str,
+    pre_onnx_path: Optional[str] = None,
+    post_onnx_path: Optional[str] = None,
+) -> str:
+    """Package compiler artifacts into a zip under a model-specific output directory.
+
+    Output layout:
+        <output_dir>/<model_name>/<model_name>.zip
+
+    Args:
+        output_dir: Base output directory provided by the user.
+        model_name: Model name used to create the subdirectory and zip filename.
+        dfp_path: Path to the compiled .dfp file.
+        chain_json_path: Path to chain.json to include in the archive.
+        pre_onnx_path: Optional path to a pre-processing ONNX model.
+        post_onnx_path: Optional path to a post-processing ONNX model.
+
+    Returns:
+        The path to the written zip file.
+    """
+    model_out_dir = join(output_dir, model_name)
+    os.makedirs(model_out_dir, exist_ok=True)
+
+    zip_path = join(model_out_dir, f"{model_name}.zip")
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        if pre_onnx_path:
+            zipf.write(pre_onnx_path, basename(pre_onnx_path))
+        if post_onnx_path:
+            zipf.write(post_onnx_path, basename(post_onnx_path))
+        zipf.write(dfp_path, basename(dfp_path))
+        zipf.write(chain_json_path, basename(chain_json_path))
+
+    return zip_path
 
 
-def onnx_to_mxa(onnx_path: str, output_dir: str, mxa_num_chips: int, mxa_extensions: Optional[str]) -> None:
+def onnx_to_mxa(model_path: str, output_dir: str) -> None:
+    """Compile a model archive (.zip) into MemryX artifacts.
 
-    # Centralized path planning for an isolated, per-run workspace.
-    paths = _plan_paths(onnx_path)
-    work_dir = paths.work_dir
-    onnx_model_name = paths.onnx_model_name
-    dfp_path = paths.dfp_path
+    The input archive must contain:
+      - ncconfig.json (flat JSON object)
+      - one or more .onnx files referenced by cfg["models"]
 
-
-    # os.cpu_count() can return None; fall back to 1 to avoid TypeError.
-    cpu_count = os.cpu_count() or 1
-    mxa_compile_processes = max(1, cpu_count - 1)
-    mxa_extensions_list = _normalize_extensions(mxa_extensions)
-
+    Args:
+        model_path: Path to the input zip archive.
+        output_dir: Output directory where artifacts will be written.
+    """
+    plan = _plan_from_archive(model_path)
 
     logs.add_message(
-        'Compilation configuration',
+        "Input archive extracted",
         {
-            'Number of Chips': mxa_num_chips,
-            'Chip Generation': mxa_chip_gen,
-            'Auto Crop': mxa_auto_crop,
-            'Compile Processes': mxa_compile_processes,
-            'Extensions':mxa_extensions_list,
-        }
+            "Workspace": plan.work_dir,
+            "Models": [basename(m) for m in plan.models],
+        },
     )
+
+    # Log the effective settings (config + toolchain overrides).
+    effective_settings = _resolved_compiler_settings_for_logs(
+        plan.cfg,
+        num_processes=plan.num_processes,
+        dfp_path=plan.dfp_path,
+    )
+    logs.add_message("Compiler settings (effective)", effective_settings)
 
     # Run the compiler with work_dir as CWD so all emitted files land there.
     cwd = os.getcwd()
     try:
-        os.chdir(work_dir)
+        os.chdir(plan.work_dir)
 
-        nc = NeuralCompiler(
-            models=onnx_path,
-            dfp_fname=dfp_path,
-            num_chips=mxa_num_chips,
-            chip_gen=mxa_chip_gen,
-            autocrop=mxa_auto_crop,
-            extensions=mxa_extensions_list,
-            effort='normal',
-            num_processes=mxa_compile_processes,
-            verbose=1,
-            show_optimization=True,
+        nc = NeuralCompiler()
+        nc.reset_config()
+
+        # Apply user config (flat) via set_config; NeuralCompiler owns validation.
+        _apply_ncconfig(nc, plan.cfg)
+
+        # Ensure models are set to the extracted workspace paths.
+        # This allows co-mapping by listing multiple ONNX files in cfg["models"].
+        nc.set_config(models=plan.models)
+
+        # Toolchain overrides always win.
+        _override_toolchain_config(
+            nc,
+            dfp_path=plan.dfp_path,
+            num_processes=plan.num_processes,
         )
 
+        # Compile.
         dfp = nc.run()
-        logs.add_message('Compilation successful')
+        logs.add_message("Compilation successful")
 
-        #get dfp io names from DFP property itself 
+        # IO names from the compiled DFP object.
         dfp_io_names = _get_dfp_io_names(dfp)
 
         # Discover emitted pre/post ONNX files inside this workspace.
-        pre_matches = sorted(glob(join(work_dir, '*_pre.onnx')))
-        post_matches = sorted(glob(join(work_dir, '*_post.onnx')))
+        pre_matches = sorted(glob(join(plan.work_dir, "*_pre.onnx")))
+        post_matches = sorted(glob(join(plan.work_dir, "*_post.onnx")))
 
         pre_onnx_path = pre_matches[0] if pre_matches else None
         post_onnx_path = post_matches[0] if post_matches else None
@@ -109,43 +337,40 @@ def onnx_to_mxa(onnx_path: str, output_dir: str, mxa_num_chips: int, mxa_extensi
         logs.add_data(
             **{
                 "Found pre file": pre_onnx_path is not None,
-                "Found post file": post_onnx_path is not None
+                "Found post file": post_onnx_path is not None,
             }
         )
 
-        # Rename artifacts to unique names to avoid collisions.
-        pre_onnx_path, dfp_path, post_onnx_path = _rename_files(pre_onnx_path, dfp_path, post_onnx_path)
+        # Create uniquely named copies of artifacts for packaging.
+        pre_onnx_path, dfp_path, post_onnx_path = _rename_files(pre_onnx_path, plan.dfp_path, post_onnx_path)
 
         # Build chain.json describing the multi-stage execution chain.
-        json_path = paths.chain_json_path
         chain_json = build_chain_json(
-            onnx_path=onnx_path,
+            onnx_path=plan.models[0],  # metadata reference; first model is sufficient for naming purposes
             pre_path=pre_onnx_path,
             dfp_path=dfp_path,
             post_path=post_onnx_path,
-            logs_dir=work_dir,
-            dfp_io_names=dfp_io_names
+            logs_dir=plan.work_dir,
+            dfp_io_names=dfp_io_names,
         )
-        with open(json_path, 'w', encoding='utf-8') as f:
+        with open(plan.chain_json_path, "w", encoding="utf-8") as f:
             f.write(json.dumps(chain_json, indent=3))
 
-        model_out_dir = join(output_dir, onnx_model_name)
-        os.makedirs(model_out_dir, exist_ok=True)
+        # Package artifacts into a zip placed inside the model-specific directory.
+        zip_path = _package_artifacts(
+            output_dir=output_dir,
+            model_name=plan.onnx_model_name,
+            dfp_path=dfp_path,
+            chain_json_path=plan.chain_json_path,
+            pre_onnx_path=pre_onnx_path,
+            post_onnx_path=post_onnx_path,
+        )
 
-        # Package artifacts into a zip placed in output_dir.
-        zip_path = join(model_out_dir, f'{onnx_model_name}.zip')
-        with zipfile.ZipFile(zip_path, 'w') as zipf:
-            if pre_onnx_path:
-                zipf.write(pre_onnx_path, basename(pre_onnx_path))
-            if post_onnx_path:
-                zipf.write(post_onnx_path, basename(post_onnx_path))
-            zipf.write(dfp_path, basename(dfp_path))
-            zipf.write(json_path, basename(json_path))
+        logs.add_message("Packaged artifacts", {"Zip Path": zip_path})
 
     finally:
         os.chdir(cwd)
-        # Intentionally not deleting work_dir to preserve artifacts for debugging.
-        # If desired later: add a flag to clean up temp output on success.
+        # Intentionally not deleting plan.work_dir to preserve artifacts for debugging.
 
 
 def build_chain_json(
@@ -404,56 +629,3 @@ def read_dfp_io_from_logs(logs_dir: Optional[str] = None) -> Dict[str, List[str]
         'Outputs': [o['layer_name'] for o in output_ports]
     }
 
-
-
-
-def _normalize_extensions(ext) -> List[str]:
-    """Normalize extensions into a list[str] suitable for NeuralCompiler.
-
-    Accepts:
-      - None
-      - string: "foo" or "foo,bar" or '["foo","bar"]'
-      - list/tuple of strings (including from argparse action='append')
-      - mixed list where elements may be comma-separated strings
-
-    Returns:
-      A list of non-empty strings.
-    """
-    if ext is None:
-        return []
-
-    # If a single string was provided, support JSON list or comma-separated values.
-    if isinstance(ext, str):
-        s = ext.strip()
-        if not s:
-            return []
-        if s.startswith("["):
-            try:
-                parsed = json.loads(s)
-                if isinstance(parsed, list):
-                    return [str(x).strip() for x in parsed if str(x).strip()]
-            except Exception:
-                pass
-        return [t.strip() for t in s.split(",") if t.strip()]
-
-    # If argparse used action='append', ext is typically a list[str].
-    if isinstance(ext, (list, tuple)):
-        out: List[str] = []
-        for item in ext:
-            if item is None:
-                continue
-            if isinstance(item, str):
-                s = item.strip()
-                if not s:
-                    continue
-                # Allow each element to be comma-separated too.
-                out.extend([t.strip() for t in s.split(",") if t.strip()])
-            else:
-                s = str(item).strip()
-                if s:
-                    out.append(s)
-        return out
-
-    # Last-resort: coerce anything else to string.
-    s = str(ext).strip()
-    return [s] if s else []
