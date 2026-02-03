@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Optional, Dict, Any
 import datetime
 import json
 import os
@@ -7,75 +7,65 @@ __all__ = ['logs']
 
 
 class Message:
-
     def __init__(self):
         self.message: str = ''
-        self.data: dict = {}
+        self.data: Dict[str, Any] = {}
 
-    def to_dict(self):
-        """Convert the message to a dictionary.
-
-        Returns:
-            dict: Message as a dictionary
-        """
-        log = {'Message': self.message}
+    def to_dict(self) -> Dict[str, Any]:
+        # Emit a consistent schema: always include Message, include Data only when present.
+        log: Dict[str, Any] = {'Message': self.message}
         if self.data:
             log['Data'] = self.data
         return log
 
-    def __str__(self):
-        log = self.to_dict()
-        return json.dumps(log, default=str)
+    def __str__(self) -> str:
+        # JSON string representation of a single message.
+        return json.dumps(self.to_dict(), default=str)
 
 
 class Logs:
-
     def __init__(self):
         self.messages: List[Message] = []
 
-    def add_message(self, message: str, data: dict = None):
-        """Add a new message to the logs.
+    def add_message(self, message: str, data: Optional[dict] = None) -> None:
+        # Append a new message entry and print for immediate visibility in CLI runs.
+        msg = Message()
+        msg.message = message
+        msg.data = data or {}
+        self.messages.append(msg)
+        print(f'{message}: {msg.data}')
 
-        Args:
-            message (str): Message to add
-            data (dict, optional): Data to add. Defaults to None.
-        """
-        self.messages.append(Message())
-        self.messages[-1].message = message
-        self.messages[-1].data = data or {}
-        print(f'{message}: {data}')
-
-    def add_data(self, **data):
-        """Add data to the last message.
-
-        Note: This may overwrite existing data.
-
-        Args:
-            data (dict): Data to add
-        """
+    def add_data(self, **data: Any) -> None:
+        # Attach additional key/value fields to the most recent message.
+        # If no message exists yet, create a placeholder message.
         try:
             self.messages[-1].data.update(data)
-        except:
+        except IndexError:
             self.add_message('<Empty Message>', data)
         print(data)
 
-    def save_as_json(self, path: str = None):
-        """Save the logs as a JSON file.
-
-        Args:
-            path (str, optional): Path to save the JSON file. Defaults to None.
-
-        Returns:
-            str: Path to the saved JSON file
-        """
+    def save_as_json(self, path: Optional[str] = None) -> str:
+        # Persist logs as pretty-printed JSON.
+        # If no path is provided, write under /tmp with a filesystem-safe timestamp.
         if path is None:
-            path = os.path.join('/', 'tmp', str(datetime.datetime.now()) + '.json')
-        with open(path, 'w') as f:
+            ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+            path = os.path.join('/', 'tmp', f'{ts}.json')
+
+        # Ensure the parent directory exists.
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        # Write using UTF-8 for consistent behavior across environments.
+        with open(path, 'w', encoding='utf-8') as f:
             f.write(str(self))
+
         return path
 
-    def __str__(self):
+    def __str__(self) -> str:
+        # Serialize all messages as a JSON array.
         messages_as_dict = [msg.to_dict() for msg in self.messages]
         return json.dumps(messages_as_dict, default=str, indent=2)
-    
+
+
 logs = Logs()
