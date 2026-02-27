@@ -4,34 +4,36 @@
 #include <stddef.h>
 #include <stdio.h>
 #include <unistd.h>
+#include "tensors_struct.h"
+// #include "runtime_ioinfo.hpp"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-typedef enum tensor_data_type {
-    DATA_TYPE_FLOAT = 1,
-    DATA_TYPE_UINT8 = 2,
-    DATA_TYPE_INT8 = 3,
-    DATA_TYPE_UINT16 = 4,
-    DATA_TYPE_INT16 = 5,
-    DATA_TYPE_INT32 = 6,
-    DATA_TYPE_INT64 = 7,
-    DATA_TYPE_STRING = 8,
-    DATA_TYPE_BOOL = 9,
-    DATA_TYPE_DOUBLE = 11,
-    DATA_TYPE_UINT32 = 12,
-    DATA_TYPE_UINT64 = 13
-} tensor_data_type;
+// typedef enum tensor_data_type {
+//     DATA_TYPE_FLOAT = 1,
+//     DATA_TYPE_UINT8 = 2,
+//     DATA_TYPE_INT8 = 3,
+//     DATA_TYPE_UINT16 = 4,
+//     DATA_TYPE_INT16 = 5,
+//     DATA_TYPE_INT32 = 6,
+//     DATA_TYPE_INT64 = 7,
+//     DATA_TYPE_STRING = 8,
+//     DATA_TYPE_BOOL = 9,
+//     DATA_TYPE_DOUBLE = 11,
+//     DATA_TYPE_UINT32 = 12,
+//     DATA_TYPE_UINT64 = 13
+// } tensor_data_type;
 
-typedef struct tensors_struct {
-    size_t num_tensors;                 // Number of tensors
-    char** names;                 // Names of the tensors
-    tensor_data_type* data_types;       // Data types of the tensors
-    size_t* ranks;                      // Ranks of the tensors
-    size_t** shapes;                    // Shapes of the tensors
-    void** data;                        // Data of the tensors
-} tensors_struct;
+// typedef struct tensors_struct {
+//     size_t num_tensors;                 // Number of tensors
+//     char** names;                 // Names of the tensors
+//     tensor_data_type* data_types;       // Data types of the tensors
+//     size_t* ranks;                      // Ranks of the tensors
+//     size_t** shapes;                    // Shapes of the tensors
+//     void** data;                        // Data of the tensors
+// } tensors_struct;
 
 
 /**
@@ -60,7 +62,26 @@ int runtime_initialization();
 int runtime_model_loading(const char *file_path);
 
 /**
- * @brief This function is called to execute the model on the input tensors.
+ * @brief This function is called to send input tensors to the runtime for inference (async interface).
+ * The runtime takes ownership of the input_tensors and will free them after processing.
+ *
+ * @param input_tensors The input tensors to feed to the model. The runtime takes ownership of this structure.
+ * @return 0 if the input is successfully enqueued, and non-zero otherwise.
+ */
+int send_input(const tensors_struct *input_tensors);
+
+/**
+ * @brief This function is called to receive output tensors from the runtime (async interface).
+ * This function may return -1 if no output is available yet. The caller should retry.
+ *
+ * @param output_tensors Pointer to receive the output tensors. The caller takes ownership and must free them.
+ * @return 0 if output is successfully retrieved, -1 if no output available, other non-zero on error.
+ */
+int receive_output(tensors_struct **output_tensors);
+
+/**
+ * @brief This function is called to execute the model on the input tensors (legacy sync interface).
+ * This is a convenience wrapper around send_input/receive_output for single-threaded use.
  *
  * @param input_tensors The input tensors to feed to the model. Note that the input tensors are completely managed by the caller (both allocation and freeing).
  * @param output_tensors The output tensors computed during inference. Note that the output tensors are completely managed by this function (both allocation and freeing).
@@ -102,6 +123,10 @@ const char *runtime_version();
  * @return The name of the shared library. This should be allocated by the shared library, and proper deallocation should be handled by the library.
  */
 const char *runtime_name();
+
+
+typedef struct io_info io_info;
+const io_info* runtime_get_io_info(void);
 
 #ifdef __cplusplus
 }

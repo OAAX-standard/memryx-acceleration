@@ -3,7 +3,7 @@
 
 #include "runtime_core.hpp"
 #include "yyjson.h"
-#include "memx/MxAccl.h"
+#include "memx/accl/MxAccl.h"
 
 #include <stddef.h>
 #include <stdlib.h>
@@ -69,5 +69,17 @@ void print_io_info(io_info *info);
  * @param info The io_info structure to free.
  */
 void free_io_info(io_info *info);
+
+
+/**
+ * @brief Initialize the io_info structure from the model_info structure Expose appropriate input output based on pre and post model connect.
+ * 
+ * @param in_info The pre_model_info if pre model is connected else model_info
+ * @param out_info The post_model_info if post model is connected else model_info   
+ * 
+ * @return The io_info structure.
+ */
+io_info* initialize_io_info_from_model_infos(const MX::Types::MxModelInfo& in_info,
+                                             const MX::Types::MxModelInfo& out_info); 
 
 #endif //RUNTIME_UTILS_HEADER
