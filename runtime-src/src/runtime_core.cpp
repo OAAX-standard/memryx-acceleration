@@ -580,7 +580,7 @@ int runtime_model_loading(const char* model_path) {
 // - Calls MemryX send_input() with pointers to the staging buffers.
 // Assumption: MemryX send_input() copies input data before returning.
 extern "C"
-int send_input(const tensors_struct* input) {
+int send_input(tensors_struct* input) {
     RuntimeContext* ctx = nullptr;
     {
         std::lock_guard<std::mutex> lk(g_ctx_mutex);
@@ -597,7 +597,6 @@ int send_input(const tensors_struct* input) {
     }
     if (!input) { ctx->set_error("send_input: input is null"); return 1; }
     if (!ctx->model_info_valid) { ctx->set_error("send_input: model_info missing"); return 1; }
-
     const size_t n = (size_t)ctx->input_ref_info.num_in_featuremaps;
     if ((size_t)input->num_tensors != n) {
         ctx->set_error("send_input: num_tensors mismatch vs expected input featuremaps");
@@ -607,7 +606,6 @@ int send_input(const tensors_struct* input) {
         ctx->set_error("send_input: cached input buffers not initialized");
         return 1;
     }
-
     // Validate and copy each input tensor into staging.
     for (size_t i = 0; i < n; ++i) {
         if (input->data_types[i] != DATA_TYPE_FLOAT) {
@@ -644,13 +642,15 @@ int send_input(const tensors_struct* input) {
         std::memcpy(ctx->in_bufs[i].data(), input->data[i], expected * sizeof(float));
     }
 
+    // Free the input tensor
+    deep_free_tensors_struct(input);
+
     // Call MemryX send_input() with a short timeout and retry loop,
     // so runtime_destruction() can stop a blocked send.
     const int32_t step_timeout_ms = 100;
     while (ctx->running_atomic.load()) {
         bool ok = false;
         {
-            std::lock_guard<std::mutex> lk(ctx->accl_call_mutex);
             ok = ctx->accl->send_input(ctx->in_ptrs, ctx->model_id, ctx->stream_id, step_timeout_ms);
         }
         if (ok) {
@@ -675,6 +675,7 @@ int receive_output(tensors_struct** output) {
     *output = nullptr;
 
     RuntimeContext* ctx = nullptr;
+    
     {
         std::lock_guard<std::mutex> lk(g_ctx_mutex);
         ctx = g_ctx.get();
@@ -716,10 +717,14 @@ int receive_output(tensors_struct** output) {
     while (ctx->running_atomic.load()) {
         bool ok = false;
         {
-            std::lock_guard<std::mutex> lk(ctx->accl_call_mutex);
+            // ok = ctx->accl->receive_output(ctx->out_ptrs, ctx->model_id, ctx->stream_id, step_timeout_ms);
+            // Removing lock to allow parallel send/recv
             ok = ctx->accl->receive_output(ctx->out_ptrs, ctx->model_id, ctx->stream_id, step_timeout_ms);
         }
-        if (ok) { got = true; break; }
+        if (ok) { 
+            got = true; 
+            break; 
+        }
         // timeout -> retry
     }
     if (!got) {

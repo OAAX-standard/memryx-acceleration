@@ -68,7 +68,7 @@ int runtime_model_loading(const char *file_path);
  * @param input_tensors The input tensors to feed to the model. The runtime takes ownership of this structure.
  * @return 0 if the input is successfully enqueued, and non-zero otherwise.
  */
-int send_input(const tensors_struct *input_tensors);
+int send_input(tensors_struct *input_tensors);
 
 /**
  * @brief This function is called to receive output tensors from the runtime (async interface).
