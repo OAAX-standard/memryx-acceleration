@@ -2,7 +2,7 @@
 
 Thank you for your interest in contributing! Before you start, please read the
 [OAAX general contributing guide](https://github.com/OAAX-standard/OAAX/blob/main/CONTRIBUTING.md)
-for project-wide conventions (bug reports, commit messages and DCO sign-off, code style).
+for project-wide conventions (bug reports, commit messages and DCO sign-off).
 
 ## How to contribute
 
